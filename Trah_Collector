@@ -1,0 +1,273 @@
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <assert.h>
+
+static Ref nextRef = 1;
+
+typedef struct MEMBLOCK MemBlock;
+
+// information needed to track our objects in memory
+struct MEMBLOCK
+{
+  int numBytes;    
+  int startAddr;   
+  Ref ref;        
+  int count;       
+  MemBlock *next;  
+};
+
+static unsigned char buffer1[MEMORY_SIZE];
+static unsigned char buffer2[MEMORY_SIZE];
+
+static unsigned char *currBuffer = buffer1;
+
+static int freeIndex = 0;
+
+void compact();
+
+static void initMemBlock( MemBlock * const pointer, const int bytes, const int addr, const Ref ref, MemBlock * const theNext )
+{
+  assert( bytes > 0 );
+  assert( ref >= 0 && ref < nextRef );
+  assert( addr >= 0 && addr < MEMORY_SIZE );
+  
+  pointer->numBytes = bytes;
+  pointer->startAddr = addr;
+  pointer->ref = ref;
+  pointer->next = theNext;
+  
+  pointer->count = 1;
+}
+
+static MemBlock *find( const Ref ref )
+{
+  
+  MemBlock *index = NULL;
+  MemBlock *ptr;
+  
+  ptr = memBlockStart;  
+  while ((ptr != NULL)  && (index == NULL))
+  {
+    if (ptr->ref == ref)
+    {
+      index = ptr;
+    }
+    else
+    {
+      ptr=ptr->next;
+    }
+  }
+  
+  return index;
+  
+}
+
+void initPool()
+{
+  memBlockStart = NULL;
+  memBlockEnd = NULL;
+  numBlocks = 0;
+}
+
+// performs required clean up
+void destroyPool()
+{
+  MemBlock *curr;
+  MemBlock *next;
+  
+  curr = memBlockStart;
+  while (curr != NULL)
+  {
+    next = curr->next;
+    free(curr);
+    curr = next;
+  }
+  
+  memBlockStart = NULL;
+  memBlockEnd = NULL;
+  numBlocks = 0;
+}
+
+Ref insertObject( const int size )
+{
+  Ref new_ref = NULL_REF;
+  
+  assert( size > 0 );
+  
+  // start by seeing if we need to garbage collect
+  if ( size >= (MEMORY_SIZE-freeIndex) )
+    compact();
+  
+  // only add the data if we have space
+  if ( size < (MEMORY_SIZE-freeIndex) )
+  {
+    // add the index information
+    
+    MemBlock *ptr = (MemBlock *)malloc(sizeof(MemBlock));
+    assert (ptr != NULL);
+    if (ptr != NULL)
+    {
+      new_ref = nextRef++;
+      initMemBlock( ptr, size, freeIndex, new_ref, NULL );
+      numBlocks++;
+      
+      //add block/node to end of list
+      if (memBlockEnd != NULL)
+        memBlockEnd->next = ptr;
+      memBlockEnd = ptr;
+      
+      //there are no blocks allocated.  This is the first one.
+      if (numBlocks == 1)
+      {
+        memBlockStart = ptr;
+      }
+      
+      // clear the data in our memory
+      memset( &currBuffer[freeIndex], 0x00, size );
+      freeIndex += size;
+      
+      assert( freeIndex <= MEMORY_SIZE );
+    }
+    
+  }
+  else
+  {
+#ifndef NDEBUG
+    printf( "Unable to successfully complete memory allocation request.\n" );
+#endif
+  }
+  return new_ref;
+}
+
+void *retrieveObject( const Ref ref )
+{
+  MemBlock *index;
+  void *object;
+  
+  assert( ref >= 0 && ref < nextRef );
+  index = find(ref);
+  
+  if (index != NULL)
+  {
+    object = &currBuffer[index->startAddr];
+  }
+  
+  // otherwise we have an error that will cause a crash!
+  else
+  {
+    printf( "Invalid reference exception with reference %ld, terminating process.\n", ref );
+    exit( EXIT_FAILURE );
+    object = NULL;
+  }
+  
+  return object;
+}
+
+void addReference( const Ref ref )
+{  
+  MemBlock *index;
+ 
+  assert( ref >= 0 && ref < nextRef );
+  index = find( ref );
+  
+  if (index != NULL)
+  {
+    index->count = index->count + 1;
+  }
+}
+
+void dropReference( const Ref ref )
+{  
+  MemBlock *index;
+  MemBlock *prev;
+  MemBlock *curr;
+  
+  assert( ref >= 0 && ref < nextRef );
+  index = find( ref );
+  
+  if (index != NULL)
+  {
+    index->count = index->count - 1;
+    if (index->count == 0)
+    {
+      if (index == memBlockStart) 
+      {
+        memBlockStart = memBlockStart->next;
+        free(index);
+      }
+      
+      else  
+      {
+        prev = memBlockStart;
+        curr = memBlockStart->next;
+        while (curr != index)
+        {
+          prev = curr;
+          curr = curr->next;
+        }
+        //see if it's the last node we are deleting.
+        if (curr == memBlockEnd)
+          memBlockEnd= prev;
+        
+        prev->next = index->next;
+        
+        free(index);
+      }
+      
+      numBlocks--;
+      
+      if (numBlocks <= 1)
+        memBlockEnd = memBlockStart;
+      
+    }
+  }
+}
+
+void compact()
+{
+  
+  // decide where we're going to put all the objects
+  unsigned char *new_buffer = (currBuffer==buffer1) ? buffer2 : buffer1;
+  int byte_count = freeIndex;
+  int object_count = 0;
+  
+  freeIndex = 0;
+  MemBlock *curr;  //used for linked list traversal
+  
+  curr = memBlockStart;
+  while (curr != NULL)
+  {
+    // copy the data and update our index
+    assert( curr->startAddr >= 0 && curr->startAddr < MEMORY_SIZE );
+    assert( curr->numBytes >= 0 && curr->numBytes < (MEMORY_SIZE-freeIndex) );
+    
+    memcpy( &new_buffer[freeIndex], &currBuffer[curr->startAddr], curr->numBytes );
+    curr->startAddr = freeIndex;
+    freeIndex += curr->numBytes;
+    curr = curr->next;
+    object_count++;
+  }
+  
+  
+#ifndef NDEBUG
+  printf( "\Trash collector specifications:\n" );
+  printf( "objects: %d   bytes in use: %d   freed: %d\n\n", object_count, freeIndex, (byte_count-freeIndex) );
+#endif
+  
+  currBuffer = new_buffer;
+}
+
+void dumpPool()
+{
+  MemBlock *curr;
+  
+  curr = memBlockStart;
+  
+  while (curr != NULL)
+  {
+    printf( "reference id = %lu, start addr = %d, num bytes = %d, reference count = %d\n", curr->ref, curr->startAddr, curr->numBytes, curr->count );
+    curr=curr->next;
+  }
+  printf( "next available index = %d\n", freeIndex );  
+}
